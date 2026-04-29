@@ -9,6 +9,9 @@ secrets.yaml
 .pio/
 build/
 
+# External components (fetched at compile time)
+esphome-miot/
+
 # OS files
 .DS_Store
 Thumbs.db

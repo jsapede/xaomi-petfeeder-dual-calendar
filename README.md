@@ -61,8 +61,7 @@ pet-feeder-esphome/
 ├── pet-feeder-esphome.yaml    ← Main configuration
 ├── secrets.yaml               ← Secrets (gitignored)
 ├── secrets.yaml.example       ← Secrets template
-├── esphome-miot/              ← External component
-├── _archive/                  ← Previous versions
+├── (esphome-miot fetched via external_components at compile time)
 ├── README.md
 ├── CHANGELOG.md
 ├── LICENSE
