@@ -1,0 +1,21 @@
+# Secrets
+secrets.yaml
+!secrets.yaml.example
+
+# ESPHome build artifacts
+.esphome/
+*.pioenvs/
+*.piolibdeps/
+.pio/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

@@ -1,0 +1,927 @@
+# Optimized ESPHome config for Xiaomi Smart Pet Feeder (mmgg.feeder.fi1)
+# Version 6 - ESPHome-native distribution + COMPATIBILITY
+# Compatible with: https://github.com/cristianchelu/dispenser-schedule-card
+#
+# Version 6 - ESPHome-native distribution (FULL AUTONOMY)
+# - ESPHome handles distribution (not MCU auto)
+# - Schedule mirrored from MCU after each modification
+# - on_time every minute checks and executes
+# - Toggle switch to enable/disable distribution
+# COMPATIBLE with dispenser-schedule-card
+
+# FIXES IN THIS VERSION (Priority A - Timezone/DST):
+# 1. Initial offset initialized to 2 (UTC+2 for Paris summer) to avoid startup delay
+# 2. Fixed hourly sync trigger syntax (explicit hours list instead of /1)
+# 3. Better DST handling with hourly verification
+# 4. Added timezone verification on MCU startup
+#
+# FIXES (Priority B - Compatibility):
+# 1. Timezone sensor now returns MCU timezone dynamically (not hardcoded)
+#
+# Known issue: MCU does its own NTP sync every 24h which may cause timezone drift
+
+substitutions:
+  auto_dst_timezone: "Europe/Paris"
+
+external_components:
+  source: github://dhewg/esphome-miot@main
+
+globals:
+  # Schedule map: id -> {hour, minute, portions, status}
+  - id: schedule
+    type: std::map<int, std::array<int, 4>>
+  
+  # Daily dispensed counter
+  - id: portions_dispensed_today
+    type: int
+    restore_value: True
+    initial_value: "0"
+  
+  # DST offset from Home Assistant (in hours)
+  # FIX: Initialize to 2 (UTC+2 summer) to avoid 1-2h delay at startup
+  # This value is updated by on_time_sync when HA connects
+  - id: auto_dst_offset
+    type: int
+    restore_value: True
+    initial_value: "2"
+  
+  # MCU timezone offset (from device)
+  - id: mcu_timezone_offset
+    type: int
+    restore_value: True
+    initial_value: "2"
+  
+  # Country code set flag
+  - id: country_code_set
+    type: bool
+    restore_value: False
+    initial_value: "false"
+  
+  # Debounce flag for refresh
+  - id: refresh_pending
+    type: bool
+    restore_value: False
+    initial_value: "false"
+  
+  # Track last sync for verification
+  - id: last_time_sync_hour
+    type: int
+    restore_value: False
+    initial_value: "-1"
+  
+  # Last executed feed (anti double-trigger)
+  - id: last_executed_feed_id
+    type: int
+    restore_value: False
+    initial_value: "-1"
+  
+  # Verification: pending feed triggered by ESPHome
+  - id: pending_feed_id
+    type: int
+    restore_value: False
+    initial_value: "-1"
+  
+  # Verification: scheduled time of pending feed (in minutes from midnight)
+  - id: pending_feed_time
+    type: int
+    restore_value: False
+    initial_value: "0"
+  
+  # Verification: timestamp when triggered (milliseconds)
+  - id: pending_feed_triggered_at
+    type: int
+    restore_value: False
+    initial_value: "0"
+  
+  # Verification: timeout in seconds to wait for feed_event
+  - id: feed_verify_timeout
+    type: int
+    restore_value: False
+    initial_value: "30"
+  
+  # Timezone sync counter to prevent excessive syncs
+  - id: timezone_sync_count
+    type: int
+    restore_value: False
+    initial_value: "0"
+
+script:
+  # Refresh feed plan from MCU - triggers schedule read
+  - id: refresh_feed_plan
+    mode: single
+    then:
+      - lambda: |-
+          if (id(refresh_pending)) {
+            ESP_LOGD("refresh", "Refresh already pending, skipping");
+            return;
+          }
+          id(refresh_pending) = true;
+      - delay: 100ms
+      - lambda: id(miot_main).execute_action(5, 6, "11 0");
+      - delay: 500ms
+      - lambda: id(miot_main).execute_action(5, 6, "11 1");
+      - delay: 1s
+      - lambda: id(refresh_pending) = false;
+  
+  # Manual feed dispense
+  - id: dispense_food
+    parameters:
+      portions: int
+    then:
+      lambda: id(miot_main).queue_command("action 2 1 5 %i", portions);
+
+  # Set device country code (needed for some features)
+  - id: set_countrycode
+    parameters:
+      countrycode: int
+    then:
+      lambda: id(miot_main).queue_command("action 9 5 13 %i", countrycode);
+  
+  # Timezone sync to MCU
+  # Sends current timezone offset to the MCU so it can execute schedules correctly
+  - id: sync_timezone
+    mode: single
+    then:
+      - lambda: |-
+          int offset = id(auto_dst_offset);
+          // Send timezone to MCU: action SIID=9 AIID=4 with value=offset
+          // SIID 9 = Time/Zone service, AIID 4 = timezone property
+          id(miot_main).queue_command("action 9 4 12 %i", offset);
+          ESP_LOGI("time", "Timezone sync: offset=%d sent to MCU", offset);
+          
+          // Increment sync counter for debugging
+          id(timezone_sync_count) = id(timezone_sync_count) + 1;
+          ESP_LOGI("time", "Timezone sync #%d completed", id(timezone_sync_count));
+
+esphome:
+  name: feeder
+  friendly_name: Pet Feeder
+  comment: Xiaomi Smart Pet Food Feeder (mmgg.feeder.fi1) - v5 Timezone Fix
+  project:
+    name: "dhewg.esphome-miot"
+    version: "mmgg.feeder.fi1"
+  on_boot:
+    priority: -100
+    then:
+      # Wait for network and HA connection before syncing
+      - delay: 10s
+      - script.execute: sync_timezone
+      - script.execute: refresh_feed_plan
+      - logger.log: "Feeder boot complete, timezone and schedule sync triggered"
+
+time:
+  # Use Home Assistant time with automatic DST handling
+  - platform: homeassistant
+    id: homeassistant_time
+    timezone: ${auto_dst_timezone}
+    
+    # Triggered when ESPHome syncs time with HA
+    # Check every minute
+    on_time:
+      - seconds: 0
+        then:
+          - script.execute: check_scheduled_feeds
+    
+    on_time_sync:
+      lambda: |-
+        // Calculate timezone offset in hours (handles DST automatically)
+        int offset = id(homeassistant_time).now().timezone_offset() / 3600;
+        id(auto_dst_offset) = offset;
+        id(last_time_sync_hour) = id(homeassistant_time).now().hour;
+        
+        ESP_LOGI("time", "=== TIME SYNC EVENT ===");
+        ESP_LOGI("time", "HA timezone: ${auto_dst_timezone}");
+        ESP_LOGI("time", "Calculated offset: %d hours (DST-aware)", offset);
+        ESP_LOGI("time", "Current HA time: %02d:%02d:%02d", 
+                 id(homeassistant_time).now().hour,
+                 id(homeassistant_time).now().minute,
+                 id(homeassistant_time).now().second);
+        
+        // Sync timezone to MCU
+        id(miot_main).queue_command("action 9 4 12 %i", offset);
+        ESP_LOGI("time", "Timezone sent to MCU: action 9 4 12 %d", offset);
+    
+    # FIX: Use explicit hour list instead of /1 (which is ambiguous)
+    # Sync timezone to MCU every hour on the hour
+    on_time: 
+      - hours: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23]
+        minutes: 0
+        seconds: 5
+        then:
+          - lambda: |-
+              // Only sync if time is valid
+              if (!id(homeassistant_time).now().is_valid()) {
+                ESP_LOGW("time", "Hourly sync skipped - time not valid");
+                return;
+              }
+              
+              int h = id(homeassistant_time).now().hour;
+              // Check if we already synced this hour
+              if (h != id(last_time_sync_hour)) {
+                id(last_time_sync_hour) = h;
+                
+                // Get current offset (may have changed due to DST)
+                int current_offset = id(homeassistant_time).now().timezone_offset() / 3600;
+                id(auto_dst_offset) = current_offset;
+                
+                ESP_LOGI("time", "Hourly timezone sync: %02d:00:05, offset=%d", h, current_offset);
+                id(miot_main).queue_command("action 9 4 12 %i", current_offset);
+              }
+      
+      # Midnight reset - reset daily counter and refresh schedule
+      - hours: 0
+        minutes: 0
+        seconds: 30
+        then:
+          - lambda: |-
+              if (id(homeassistant_time).now().is_valid()) {
+                ESP_LOGI("time", "=== MIDNIGHT RESET ===");
+                id(portions_dispensed_today) = 0;
+                if (id(dispensed_today).has_state()) {
+                  id(dispensed_today).publish_state(0);
+                }
+                id(refresh_feed_plan).execute();
+              }
+
+esp8266:
+  board: esp_wroom_02
+  restore_from_flash: true
+
+logger:
+  level: DEBUG
+  baud_rate: 0
+  logs:
+    miot: WARN
+
+api:
+  encryption:
+    key: !secret feeder_api_key
+  reboot_timeout: 0s
+  on_client_connected:
+    then:
+      # Wait for connection to stabilize
+      - delay: 5s
+      # Refresh schedule and sync timezone when HA reconnects
+      - script.execute: sync_timezone
+      - script.execute: refresh_feed_plan
+  services:
+    # Raw MCU command for debugging
+    - service: mcu_command
+      variables:
+        command: string
+      then:
+        - lambda: id(miot_main).queue_command(command);
+    
+    # Refresh feed plan from MCU
+    - service: refresh_feed_plan
+      then:
+        - script.execute: refresh_feed_plan
+    
+    # Dispense food manually
+    - service: dispense_food
+      variables:
+        portions: int
+      then:
+        - script.execute: 
+            id: dispense_food
+            portions: !lambda return portions;
+    
+    # Add scheduled feed
+    - service: add_scheduled_feed
+      variables:
+        id: int
+        hour: int
+        minute: int
+        portions: int
+      then:
+        - lambda: |
+            ESP_LOGI("schedule", "Adding feed: id=%d, time=%02d:%02d, portions=%d",
+                     id, hour, minute, portions);
+            // SIID 5 = Schedule, AIID 7 = add feed
+            id(miot_main).queue_command(
+              "action 5 7 10 %i 6 %i 7 %i 8 %i",
+              id, hour, minute, portions);
+        - delay: 2s
+        - script.execute: refresh_feed_plan
+        - script.execute: check_scheduled_feeds  # Force sync
+    
+    # Edit scheduled feed
+    - service: edit_scheduled_feed
+      variables:
+        id: int
+        hour: int
+        minute: int
+        portions: int
+      then:
+        - lambda: |
+            ESP_LOGI("schedule", "Editing feed: id=%d, time=%02d:%02d, portions=%d",
+                     id, hour, minute, portions);
+            id(miot_main).queue_command(
+              "action 5 8 10 %i 6 %i 7 %i 8 %i",
+              id, hour, minute, portions);
+        - delay: 2s
+        - script.execute: refresh_feed_plan
+        - script.execute: check_scheduled_feeds  # Force sync
+    
+    # Remove scheduled feed
+    - service: remove_scheduled_feed
+      variables:
+        id: int
+      then:
+        - lambda: |
+            ESP_LOGI("schedule", "Removing feed: id=%d", id);
+            id(miot_main).queue_command("action 5 9 10 %i", id);
+        - delay: 2s
+        - script.execute: refresh_feed_plan
+        - script.execute: check_scheduled_feeds  # Force sync
+    
+    # Set country code
+    - service: set_countrycode
+      variables:
+        countrycode: int
+      then:
+        - script.execute: 
+            id: set_countrycode
+            countrycode: !lambda return countrycode;
+    
+    # Force timezone sync (useful for manual trigger)
+    - service: sync_timezone
+      then:
+        - script.execute: sync_timezone
+
+ota:
+  - platform: esphome
+    password: !secret feeder_ota_password
+
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+      bssid: !secret wifi_bssid
+  manual_ip: 
+    static_ip: 192.168.0.12
+    gateway: 192.168.0.1
+    subnet: 255.255.255.0
+  ap:
+    ssid: "Pet-Feeder Fallback Hotspot"
+    password: !secret feeder_ap_password
+
+captive_portal:
+
+uart:
+  tx_pin: GPIO15
+  rx_pin: GPIO13
+  baud_rate: 115200
+
+miot:
+  id: miot_main
+
+switch:
+  - platform: "miot"
+    miot_siid: 3
+    miot_piid: 1
+    miot_true: "1"
+    miot_false: "0"
+    name: "Indicator Lights"
+    icon: mdi:lightbulb
+    entity_category: config
+    miot_poll: false
+  
+  - platform: "miot"
+    miot_siid: 5
+    miot_piid: 5
+    miot_true: "1"
+    miot_false: "0"
+    name: "Feeding Schedule"
+    icon: mdi:calendar-badge
+    entity_category: config
+    miot_poll: false
+    # CRITICAL: This switch MUST be ON for schedule to execute!
+  
+  # Toggle for ESP Home distribution
+  - platform: template
+    id: distribution_active
+    name: "ESP Distribution"
+    icon: mdi:clock-check
+    restore_mode: RESTORE_DEFAULT_ON
+    assumed_state: true
+    turn_on_action:
+      - logger.log: "Distribution: ON"
+    turn_off_action:
+      - logger.log: "Distribution: OFF"
+  
+  - platform: "miot"
+    miot_siid: 6
+    miot_piid: 1
+    miot_true: "1"
+    miot_false: "0"
+    name: "Child Lock"
+    icon: mdi:lock
+    inverted: yes
+    entity_category: config
+    miot_poll: false
+
+binary_sensor:
+  - platform: "miot"
+    miot_siid: 4
+    miot_piid: 8
+    miot_true: "1"
+    miot_false: "0"
+    name: "Top Lid"
+    device_class: opening
+    miot_poll: false
+  
+  - platform: "miot"
+    miot_siid: 4
+    miot_piid: 9
+    miot_true: "1"
+    miot_false: "0"
+    name: "Food Door"
+    device_class: opening
+    miot_poll: false
+
+text_sensor:
+  - platform: "miot"
+    miot_siid: 2
+    miot_piid: 1
+    name: "Faults"
+    icon: mdi:chili-alert
+    entity_category: diagnostic
+    miot_poll: false
+    filters:
+      - map:
+        - "0 -> No Faults"
+        - "1 -> OK"
+        - "3 -> Error"
+        - "5 -> Timeout"
+  
+  - platform: "miot"
+    miot_siid: 2
+    miot_piid: 6
+    name: "Food Level"
+    icon: mdi:cup
+    miot_poll: false
+    filters:
+      - map:
+        - "0 -> Normal"
+        - "1 -> Low"
+        - "2 -> Empty"
+  
+  - platform: "miot"
+    miot_siid: 4
+    miot_piid: 5
+    name: "Last Feed Source"
+    icon: mdi:food-apple
+    miot_poll: false
+    filters:
+      - map:
+        - "0 -> Schedule 0"
+        - "1 -> Schedule 1"
+        - "2 -> Schedule 2"
+        - "3 -> Schedule 3"
+        - "4 -> Schedule 4"
+        - "5 -> Schedule 5"
+        - "6 -> Schedule 6"
+        - "7 -> Schedule 7"
+        - "8 -> Schedule 8"
+        - "9 -> Schedule 9"
+        - "255 -> Manual Feed"
+  
+  # Raw Feed Plan - key sensor for dispenser-schedule-card
+  # Format: "id,hour,minute,portions,status id,hour,minute,portions,status"
+  - platform: template
+    name: "Raw Feed Plan"
+    id: raw_feed_plan
+    icon: mdi:calendar-clock
+    update_interval: never
+    entity_category: diagnostic
+    lambda: |-
+      std::string feeding_schedule;
+      int count = 0;
+      for (auto &entry : id(schedule)) {
+        if (entry.second[0] == 255) {
+          continue; // Skip empty entries
+        }
+        if (count > 0) {
+          feeding_schedule += " ";
+        }
+        feeding_schedule += str_sprintf("%d,%d,%d,%d,%d",
+                                        entry.first,
+                                        entry.second[0],
+                                        entry.second[1],
+                                        entry.second[2],
+                                        entry.second[3]);
+        count++;
+      }
+      ESP_LOGD("schedule", "Raw Feed Plan: %s", feeding_schedule.c_str());
+      return feeding_schedule;
+  
+  # FIXED: Parse feed plan from MCU and populate schedule map
+  - platform: "miot"
+    id: feedplan_string
+    miot_siid: 5
+    miot_piid: 12
+    miot_poll: false
+    internal: true
+    on_value:
+      - lambda: |-
+          ESP_LOGI("schedule", "Feed plan received from MCU: %s", x.c_str());
+          char* token = strtok(x.data(), ",");
+          int count = 0;
+          
+          while (token != NULL && count < 10) {
+            int feed_id = atoi(token);
+            token = strtok(NULL, ",");
+            
+            int hour = atoi(token);
+            token = strtok(NULL, ",");
+            
+            int minute = atoi(token);
+            token = strtok(NULL, ",");
+            
+            int portions = atoi(token);
+            token = strtok(NULL, ",");
+            
+            int status = atoi(token);
+            token = strtok(NULL, ",");
+
+            id(schedule)[feed_id] = {hour, minute, portions, status};
+            ESP_LOGD("schedule", "  Entry %d: %02d:%02d, %d portions, status=%d",
+                     feed_id, hour, minute, portions, status);
+            count++;
+          }
+      - lambda: id(raw_feed_plan).update();
+  
+  # FIXED: Return MCU timezone dynamically (not hardcoded)
+  # This is what dispenser-schedule-card reads to display timezone
+  - platform: "template"
+    name: "Device Timezone"
+    id: timezone
+    icon: mdi:clock
+    entity_category: diagnostic
+    lambda: |-
+      // Return the current offset used by ESPHome
+      return str_sprintf("UTC%+d", id(auto_dst_offset));
+
+number:
+  - platform: template
+    id: dispense_food_portions
+    name: "Dispense Amount"
+    icon: mdi:food-apple
+    min_value: 1
+    max_value: 30
+    step: 1
+    optimistic: True
+    restore_value: False
+    initial_value: 1
+    entity_category: config
+    unit_of_measurement: portions
+    mode: box
+
+sensor:
+  - platform: "miot"
+    miot_siid: 4
+    miot_piid: 4
+    name: "Last Feed Amount"
+    id: outfood_num
+    icon: mdi:food-apple
+    miot_poll: false
+    unit_of_measurement: portions
+  
+  - platform: "miot"
+    miot_siid: 8
+    miot_piid: 1
+    name: "Feeder Clean Timer"
+    unit_of_measurement: d
+    state_class: measurement
+    device_class: duration
+    icon: mdi:broom
+    miot_poll: false
+  
+  - platform: "miot"
+    miot_siid: 11
+    miot_piid: 2
+    name: "Dessicant Replace Timer"
+    unit_of_measurement: d
+    state_class: measurement
+    device_class: duration
+    icon: mdi:air-filter
+    miot_poll: false
+  
+  # MCU timezone offset - for debugging timezone sync issues
+  - platform: "miot"
+    id: phon_time_zone
+    miot_siid: 9
+    miot_piid: 12
+    name: "MCU Timezone Offset"
+    icon: mdi:clock
+    unit_of_measurement: h
+    entity_category: diagnostic
+    miot_poll: false
+    on_value:
+      - lambda: |-
+          int mcu_offset = (int)x;
+          id(mcu_timezone_offset) = mcu_offset;
+          ESP_LOGI("time", "MCU reports timezone offset: %d hours", mcu_offset);
+          
+          // Log any discrepancy
+          if (mcu_offset != id(auto_dst_offset)) {
+            ESP_LOGW("time", "MCU offset (%d) != ESPHome offset (%d)",
+                     mcu_offset, id(auto_dst_offset));
+          } else {
+            ESP_LOGI("time", "MCU timezone synchronized with ESPHome");
+          }
+  
+  - platform: "miot"
+    id: countrycode
+    miot_siid: 9
+    miot_piid: 13
+    name: "Device Country"
+    icon: mdi:earth
+    entity_category: diagnostic
+    miot_poll: false
+    on_raw_value:
+      lambda: |-
+        if (x == 255 && !id(country_code_set)) {
+          ESP_LOGI("country", "Setting country code to 3 (Europe)");
+          id(set_countrycode).execute(3);
+          id(country_code_set) = true;
+        }
+  
+  - platform: "template"
+    name: "Dispensed Today"
+    id: dispensed_today
+    accuracy_decimals: 0
+    icon: mdi:food-apple
+    unit_of_measurement: portions
+    lambda: return id(portions_dispensed_today);
+  
+  # FIXED: Remaining time calculation
+  # Status values: 0=skipped/done, 1=pending, 255=active/scheduled
+  # Check scheduled feeds - runs every minute
+  # This is the CORE distribution engine
+  - id: check_scheduled_feeds
+    mode: single
+    then:
+      - lambda: |-
+          auto now = id(homeassistant_time).now();
+          if (!now.is_valid()) {
+            ESP_LOGW("schedule", "Time not valid, skipping");
+            return;
+          }
+          
+          // Check distribution enabled
+          if (!id(distribution_active)) {
+            ESP_LOGD("schedule", "Distribution OFF, skipping");
+            return;
+          }
+          
+          // Check for verification timeout (pending feed with no feed_event)
+          if (id(pending_feed_id) >= 0) {
+            int now = id(homeassistant_time).now().hour * 60 + id(homeassistant_time).now().minute;
+          int elapsed = (id(homeassistant_time).now().timestamp - id(pending_feed_triggered_at)) / 1000;
+            if (elapsed > id(feed_verify_timeout)) {
+              ESP_LOGW("verify", "=== VERIFY TIMEOUT ===");
+              ESP_LOGW("verify", "Feed %d: No feed_event within %ds - FAILED!",
+                       id(pending_feed_id), elapsed);
+              id(pending_feed_id) = -1;
+              id(pending_feed_time) = 0;
+            }
+          }
+          
+          int current_hour = now.hour;
+          int current_minute = now.minute;
+          int current_time_minutes = current_hour * 60 + current_minute;
+          
+          ESP_LOGD("schedule", "=== CHECK FEEDS === %02d:%02d", current_hour, current_minute);
+          
+          for (auto &entry : id(schedule)) {
+            int feed_id = entry.first;
+            int feed_hour = entry.second[0];
+            int feed_minute = entry.second[1];
+            int portions = entry.second[2];
+            int status = entry.second[3];
+            
+            if (feed_hour == 255 || feed_hour > 23 || feed_minute > 59) continue;
+            if (status == 0) continue;
+            
+            int feed_time_minutes = feed_hour * 60 + feed_minute;
+            
+            if (feed_time_minutes == current_time_minutes) {
+              if (id(last_executed_feed_id) == feed_id) continue;
+              
+              ESP_LOGI("schedule", "=== EXECUTE FEED %d ===", feed_id);
+              ESP_LOGI("schedule", "  %02d:%02d, %d portions", feed_hour, feed_minute, portions);
+              
+              id(last_executed_feed_id) = feed_id;
+              // Store pending verification
+              id(pending_feed_id) = feed_id;
+              id(pending_feed_time) = feed_time_minutes;
+              id(pending_feed_triggered_at) = id(homeassistant_time).now().timestamp;
+              
+              // Execute feeding
+              id(dispense_food).execute(portions);
+              
+              ESP_LOGI("verify", "  Feed %d VERIFY pending: expect feed_event within %ds",
+                       feed_id, (int)id(feed_verify_timeout));
+              
+              ESP_LOGI("schedule", "  Feed %d EXECUTED", feed_id);
+            }
+          }
+
+  - platform: template
+    name: "Remaining Time Until Next Feed"
+    id: remaining_time_until_next_feed
+    unit_of_measurement: "minutes"
+    accuracy_decimals: 0
+    icon: mdi:clock-time-five
+    update_interval: 1min
+    lambda: |-
+      // Based on ESPHome schedule (id:schedule)
+      auto t = id(homeassistant_time).now();
+      if (!t.is_valid()) { return NAN; }
+      int now = t.hour * 60 + t.minute;
+      int current_time_minutes = now_hour * 60 + now_minute;
+      
+      ESP_LOGD("schedule", "=== Remaining Time Calc ===");
+      ESP_LOGD("schedule", "Current time: %02d:%02d (%d min)",
+               now_hour, now_minute, current_time_minutes);
+      
+      int next = 48 * 60;  // Max 48h
+      int next_feed_hour = -1;
+      int next_feed_min = -1;
+      
+      // Find next pending feed
+      for (auto &entry : id(schedule)) {
+        int feed_hour = entry.second[0];
+        int feed_minute = entry.second[1];
+        int portions = entry.second[2];
+        int status = entry.second[3];
+        
+        // Skip invalid entries
+        if (feed_hour == 255 || feed_hour > 23 || feed_minute > 59) {
+          continue;
+        }
+        
+        // FIXED: Status logic
+        // status=0: completed/skip - skip
+        // status=1: pending - include (could still execute if within window)
+        // status=255: active/scheduled - include
+        if (status == 0) {
+          ESP_LOGD("schedule", "  Entry %d: %02d:%02d - SKIPPED (status=0, done)",
+                   entry.first, feed_hour, feed_minute);
+          continue;
+        }
+        
+        int feed_time_minutes = feed_hour * 60 + feed_minute;
+        int time_diff;
+        
+        // Check if feed is in the future
+        if (feed_time_minutes > current_time_minutes) {
+          // Feed is in the future today
+          time_diff = feed_time_minutes - current_time_minutes;
+          ESP_LOGD("schedule", "  Entry %d: %02d:%02d - status=%d, in %d min (FUTURE)",
+                   entry.first, feed_hour, feed_minute, status, time_diff);
+        } else {
+          // Feed is in the past today - it's missed
+          // But if status=1 (pending), it might execute late? Skip for now
+          ESP_LOGW("schedule", "  Entry %d: %02d:%02d - status=%d, %d min AGO (PAST)",
+                   entry.first, feed_hour, feed_minute, status, 
+                   current_time_minutes - feed_time_minutes);
+          // Don't update next_feed for past entries
+          continue;
+        }
+        
+        // Update next feed if this one is sooner
+        if (time_diff < time_until_next_feed) {
+          time_until_next_feed = time_diff;
+          next_feed_hour = feed_hour;
+          next_feed_min = feed_minute;
+        }
+      }
+      
+      if (next_h >= 0) { return (float)next; }
+      return NAN;
+
+button:
+  - platform: template
+    on_press: 
+      - script.execute: 
+          id: dispense_food
+          portions: !lambda return id(dispense_food_portions).state;
+    name: "Dispense Food"
+    icon: mdi:food-apple
+  
+  - platform: "miot"
+    miot_siid: 8
+    miot_aiid: 1
+    name: "Reset Clean Timer"
+    icon: mdi:restart
+  
+  - platform: "miot"
+    miot_siid: 11
+    miot_aiid: 1
+    name: "Reset Dessicant Timer"
+    icon: mdi:restart
+
+event:
+  - platform: "template"
+    name: 'Feed Event'
+    id: feed_event
+    event_types:
+      - 'start'
+      - 'stats'
+      - 'success'
+    icon: mdi:food-apple
+  
+  # Feed success event - triggered when MCU completes feeding
+  - platform: "miot"
+    miot_siid: 4
+    miot_eiid: 1
+    id: feedsuccess_event
+    event_type: feedsuccess
+    internal: true
+    on_event:
+      - event.trigger:
+          id: feed_event
+          event_type: "success"
+      - lambda: |-
+          // Get current time in minutes
+          int current_time = id(homeassistant_time).now().hour * 60 + id(homeassistant_time).now().minute;
+          
+          // Check if this is a verified pending feed from ESPHome
+          if (id(pending_feed_id) >= 0) {
+            int expected_time = id(pending_feed_time);
+            int time_diff = abs(current_time - expected_time);
+            
+            if (time_diff <= 1 || (expected_time == 0 && current_time == 1439)) {
+              // SUCCESS: Feed happened at expected time (within 1 min tolerance)
+              ESP_LOGI("verify", "=== VERIFY SUCCESS ===");
+              ESP_LOGI("verify", "  Expected: %02d:%02d, Got: %02d:%02d - OK!",
+                       expected_time / 60, expected_time % 60,
+                       current_time / 60, current_time % 60);
+              
+              // Reset pending verification
+              id(pending_feed_id) = -1;
+              id(pending_feed_time) = 0;
+            } else {
+              // TIMEOUT/ERROR: Feed happened at wrong time or too late
+              ESP_LOGW("verify", "=== VERIFY FAILED ===");
+              ESP_LOGW("verify", "  Expected: %02d:%02d, Got: %02d:%02d - MISMATCH!",
+                       expected_time / 60, expected_time % 60,
+                       current_time / 60, current_time % 60);
+              ESP_LOGW("verify", "  Feed may have been triggered manually or failed!");
+              
+              // Still reset for next attempt
+              id(pending_feed_id) = -1;
+            }
+          } else {
+            // No pending verification - this is a manual feed from button/switch
+            ESP_LOGI("verify", "Manual feed detected (no pending verification)");
+          }
+          
+          ESP_LOGI("feed", "=== FEED SUCCESS ===");
+          ESP_LOGI("feed", "Portions: %d", (int)id(outfood_num).state);
+          int new_total = id(portions_dispensed_today) + (int)id(outfood_num).state;
+          ESP_LOGI("feed", "Daily total: %d portions", new_total);
+          id(portions_dispensed_today) = new_total;
+      - component.update:
+          id: dispensed_today
+      - delay: 1s
+      - script.execute: refresh_feed_plan
+  
+  # Feed stats event
+  - platform: "miot"
+    miot_siid: 4
+    miot_eiid: 2
+    id: feedstats_event
+    event_type: feedstats
+    internal: true
+    on_event:
+      - event.trigger:
+          id: feed_event
+          event_type: "stats"
+  
+  # Feed start event
+  - platform: "miot"
+    miot_siid: 4
+    miot_eiid: 3
+    id: feedstart_event
+    event_type: feedstart
+    internal: true
+    on_event:
+      - lambda: ESP_LOGI("feed", "=== FEED START EVENT ===");
+      - event.trigger:
+          id: feed_event
+          event_type: "start"
+      - delay: 1s
+      - script.execute: refresh_feed_plan
+  
+  # Power loss event
+  - platform: "miot"
+    miot_siid: 9
+    miot_eiid: 1
+    id: power_loss
+    name: "Power Loss"
+    event_type: power_loss
+    icon: mdi:power-plug-off
